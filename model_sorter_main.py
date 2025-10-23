@@ -753,10 +753,10 @@ class ModelSorterOrchestrator:
                 
                 if not actual_model_path:
                     if self.verbose:
-                        print(f"   ⚠️ Model file not found in database path or target directory")
+                        print(f"   ⚠️ Model file not found in database path or destination directory")
                         print(f"      Database path checked: {model_path}")
-                        target_dir = self.scanner.config.get('target_directory', 'Not configured')
-                        print(f"      Target directory searched: {target_dir}")
+                        dest_dir = self.scanner.config.get('destination_directory', 'Not configured')
+                        print(f"      Destination directory searched: {dest_dir}")
                     continue
                 elif actual_model_path != model_path:
                     if self.verbose:
@@ -2039,19 +2039,19 @@ class ModelSorterOrchestrator:
         
         # If not found, search in target directory structure
         try:
-            target_directory = self.scanner.config.get('target_directory', '')
+            target_directory = self.scanner.config.get('destination_directory', '')
             if not target_directory:
                 if self.verbose:
-                    print(f"      No target directory configured in config.ini")
+                    print(f"      No destination directory configured in config.ini")
                 return ""
             
             if not os.path.exists(target_directory):
                 if self.verbose:
-                    print(f"      Target directory does not exist: {target_directory}")
+                    print(f"      Destination directory does not exist: {target_directory}")
                 return ""
             
             if self.verbose:
-                print(f"      Searching target directory: {target_directory}")
+                print(f"      Searching destination directory: {target_directory}")
             
             # Search for the model file in the target directory structure
             model_filename = os.path.basename(database_path)
