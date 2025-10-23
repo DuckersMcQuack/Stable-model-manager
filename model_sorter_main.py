@@ -915,9 +915,9 @@ class ModelSorterOrchestrator:
                     
                     # METHOD 1.5: Enhanced content-based correlation (ALWAYS check for metadata files and media)
                     content_correlation_result = None
-                    if model_sha256 and assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg')):
+                    if assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg')):
                         content_correlation_result = self._analyze_content_correlation(
-                            assoc_path, assoc_name, model_name, model_sha256, model_autov3 or ""
+                            assoc_path, assoc_name, model_name, model_sha256 or "", model_autov3 or ""
                         )
                         if content_correlation_result['should_link'] and not should_link:
                             should_link = True
@@ -1052,12 +1052,25 @@ class ModelSorterOrchestrator:
                                     print(f"   ✓ Base name + strong content correlation: {assoc_name}")
                                     print(f"      Correlation: {content_correlation_result['details']}")
                     
-                    # METHOD 3: Basic exact name match (fallback)
+                    # METHOD 3: Enhanced exact name match (with content correlation support)
                     elif assoc_base_name == model_base_name:
-                        should_link = True
-                        match_reason = "Exact name match"
-                        if self.verbose:
-                            print(f"   ✓ Exact name match: {assoc_name}")
+                        # For documentation/metadata files with exact name matches, use content correlation to boost confidence
+                        if (content_correlation_result and content_correlation_result.get('confidence_score', 0) >= 50) or assoc_name.lower().endswith(('.md', '.txt', '.json', '.yml', '.yaml', '.civitai.info')):
+                            should_link = True
+                            if content_correlation_result and content_correlation_result['should_link']:
+                                match_reason = f"Exact name + content correlation ({content_correlation_result['reason']})"
+                                if self.verbose:
+                                    print(f"   ✓ Exact name + content correlation match: {assoc_name}")
+                                    print(f"      Correlation: {content_correlation_result['details']}")
+                            else:
+                                match_reason = "Exact name match (documentation file)"
+                                if self.verbose:
+                                    print(f"   ✓ Exact name match (documentation): {assoc_name}")
+                        else:
+                            should_link = True
+                            match_reason = "Exact name match"
+                            if self.verbose:
+                                print(f"   ✓ Exact name match: {assoc_name}")
                     
                     # METHOD 4: Single model scenario (fallback)
                     elif len(models_needing_associations) == 1:  # Only one model in this batch
@@ -1782,6 +1795,20 @@ class ModelSorterOrchestrator:
             
             file_ext = os.path.splitext(file_path)[1].lower()
             
+            # PRIORITY CHECK: Exact base filename match for documentation files
+            model_base = os.path.splitext(model_name)[0].lower()
+            file_base = os.path.splitext(file_name)[0].lower()
+            
+            if (file_base == model_base and 
+                file_ext in ['.md', '.txt', '.json', '.yml', '.yaml', '.civitai.info']):
+                result.update({
+                    'should_link': True,
+                    'reason': 'exact_filename_match',
+                    'details': f'Exact filename match: {file_base} == {model_base}',
+                    'confidence_score': 95
+                })
+                return result
+            
             # METHOD 1: Deep image metadata analysis
             if file_ext in ['.png', '.jpg', '.jpeg', '.webp']:
                 try:
@@ -1850,15 +1877,15 @@ class ModelSorterOrchestrator:
                         print(f"    Warning: Error analyzing image metadata for {file_name}: {e}")
             
             # METHOD 2: Enhanced text/metadata file analysis
-            elif file_ext in ['.json', '.txt', '.metadata.json']:
+            elif file_ext in ['.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info']:
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                     
                     content_lower = content.lower()
                     
-                    # Direct hash reference (highest confidence)
-                    if model_sha256.lower() in content_lower or (model_autov3 and model_autov3.lower() in content_lower):
+                    # Direct hash reference (highest confidence) - only if hash available
+                    if model_sha256 and (model_sha256.lower() in content_lower or (model_autov3 and model_autov3.lower() in content_lower)):
                         result.update({
                             'should_link': True,
                             'reason': 'direct_hash_reference',
@@ -1876,18 +1903,19 @@ class ModelSorterOrchestrator:
                             model_fields = ['model_name', 'name', 'title', 'filename', 'base_model']
                             hash_fields = ['sha256', 'model_hash', 'hash', 'hashes']
                             
-                            # Check structured hash fields
-                            for field in hash_fields:
-                                if field in json_data:
-                                    field_value = str(json_data[field]).lower()
-                                    if model_sha256.lower() in field_value or (model_autov3 and model_autov3.lower() in field_value):
-                                        result.update({
-                                            'should_link': True,
-                                            'reason': f'structured_hash_{field}',
-                                            'details': f'Hash match in JSON field "{field}"',
-                                            'confidence_score': 95
-                                        })
-                                        return result
+                            # Check structured hash fields (only if hashes available)
+                            if model_sha256:
+                                for field in hash_fields:
+                                    if field in json_data:
+                                        field_value = str(json_data[field]).lower()
+                                        if model_sha256.lower() in field_value or (model_autov3 and model_autov3.lower() in field_value):
+                                            result.update({
+                                                'should_link': True,
+                                                'reason': f'structured_hash_{field}',
+                                                'details': f'Hash match in JSON field "{field}"',
+                                                'confidence_score': 95
+                                            })
+                                            return result
                             
                             # Check model identifier fields with enhanced matching
                             import re
