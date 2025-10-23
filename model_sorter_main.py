@@ -913,17 +913,18 @@ class ModelSorterOrchestrator:
                         if self.verbose:
                             print(f"   ✓ Advanced correlation match: {assoc_name}")
                     
-                    # METHOD 1.5: Enhanced content-based correlation for files not caught by basic correlation
-                    elif not should_link and model_sha256:
-                        correlation_result = self._analyze_content_correlation(
+                    # METHOD 1.5: Enhanced content-based correlation (ALWAYS check for metadata files and media)
+                    content_correlation_result = None
+                    if model_sha256 and assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg')):
+                        content_correlation_result = self._analyze_content_correlation(
                             assoc_path, assoc_name, model_name, model_sha256, model_autov3 or ""
                         )
-                        if correlation_result['should_link']:
+                        if content_correlation_result['should_link'] and not should_link:
                             should_link = True
-                            match_reason = f"Content correlation ({correlation_result['reason']})"
+                            match_reason = f"Content correlation ({content_correlation_result['reason']})"
                             if self.verbose:
                                 print(f"   ✓ Content correlation match: {assoc_name}")
-                                print(f"      Reason: {correlation_result['details']}")
+                                print(f"      Reason: {content_correlation_result['details']}")
                     
                     # METHOD 2: Adaptive filename matching - version-aware or base name
                     elif not should_link:
@@ -1004,30 +1005,52 @@ class ModelSorterOrchestrator:
                                     if self.verbose:
                                         print(f"   ⚠️ Database search error: {e}")
                             
-                            # If file found, perform content correlation to confirm relationship
-                            if target_file_found and target_file_path and model_sha256:
-                                correlation_result = self._analyze_content_correlation(
-                                    target_file_path, assoc_name, model_name, model_sha256, model_autov3 or ""
-                                )
+                            # If file found, use previously computed correlation or perform new analysis
+                            if target_file_found and target_file_path:
+                                # Use existing correlation result if available, otherwise analyze
+                                if content_correlation_result is not None:
+                                    correlation_result = content_correlation_result
+                                elif model_sha256:
+                                    correlation_result = self._analyze_content_correlation(
+                                        target_file_path, assoc_name, model_name, model_sha256, model_autov3 or ""
+                                    )
+                                else:
+                                    correlation_result = {'should_link': False, 'reason': 'no_hash', 'details': 'No model hash available'}
+                                
                                 if correlation_result['should_link']:
                                     should_link = True
                                     match_reason = f"Base name + target search + content correlation ({correlation_result['reason']})"
                                     if self.verbose:
-                                        print(f"   ✓ Base name + target search match: {assoc_name}")
+                                        print(f"   ✓ Base name + target search + content correlation: {assoc_name}")
                                         print(f"      Found at: {target_file_path}")
                                         print(f"      Correlation: {correlation_result['details']}")
                                     # Update the assoc_path to point to the found file
                                     assoc_path = target_file_path
                                 elif target_file_found:
-                                    # Base name matches and file exists, but content doesn't correlate strongly
-                                    # Still link it as it's likely related (same base name is significant)
-                                    should_link = True
-                                    match_reason = "Base name + target search (weak content correlation)"
-                                    if self.verbose:
-                                        print(f"   ✓ Base name + target search match (weak correlation): {assoc_name}")
-                                        print(f"      Found at: {target_file_path}")
-                                    # Update the assoc_path to point to the found file
-                                    assoc_path = target_file_path
+                                    # Base name matches and file exists - check if we should link based on content quality
+                                    confidence_score = correlation_result.get('confidence_score', 0)
+                                    if confidence_score >= 30:  # Moderate confidence threshold
+                                        should_link = True
+                                        match_reason = f"Base name + target search + moderate correlation (score: {confidence_score})"
+                                        if self.verbose:
+                                            print(f"   ✓ Base name + target search + moderate correlation: {assoc_name}")
+                                            print(f"      Found at: {target_file_path}")
+                                            print(f"      Confidence: {confidence_score}% - {correlation_result['details']}")
+                                        # Update the assoc_path to point to the found file
+                                        assoc_path = target_file_path
+                                    else:
+                                        if self.verbose:
+                                            print(f"   ⚠️ Base name matches but low content correlation: {assoc_name}")
+                                            print(f"      Found at: {target_file_path}")
+                                            print(f"      Low confidence: {confidence_score}% - {correlation_result['details']}")
+                            
+                            # Even if file not found in target, check if we have strong content correlation from current location
+                            elif not target_file_found and content_correlation_result and content_correlation_result['should_link']:
+                                should_link = True
+                                match_reason = f"Base name + strong content correlation ({content_correlation_result['reason']})"
+                                if self.verbose:
+                                    print(f"   ✓ Base name + strong content correlation: {assoc_name}")
+                                    print(f"      Correlation: {content_correlation_result['details']}")
                     
                     # METHOD 3: Basic exact name match (fallback)
                     elif assoc_base_name == model_base_name:
