@@ -1,0 +1,3 @@
+# Sample models directory
+# Place your test .safetensors, .ckpt, .pt files here for testing the scripts
+# These files are ignored by git - add your own test models

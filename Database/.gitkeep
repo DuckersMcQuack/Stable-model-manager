@@ -1,0 +1,2 @@
+# This file keeps the Database directory in git while excluding the actual database files
+# Users should download civitai.sqlite separately and place it in this directory

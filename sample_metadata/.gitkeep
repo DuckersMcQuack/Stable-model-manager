@@ -1,0 +1,3 @@
+# Sample metadata directory
+# Place your test .json, .txt, .civitai.info files here for testing
+# These files are ignored by git - add your own test metadata files
