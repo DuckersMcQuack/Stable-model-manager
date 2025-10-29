@@ -666,7 +666,12 @@ class ModelSorterOrchestrator:
             
             # Initialize batch commit tracking
             associations_since_last_commit = 0
-            COMMIT_BATCH_SIZE = 100  # Commit every 100 associations
+            # Read commit batch size from config
+            config = self.load_config()
+            COMMIT_BATCH_SIZE = config.getint('Logging', 'database_commit_batch_size', fallback=100)
+            
+            if self.verbose:
+                print(f"📊 Association commit batch size: {COMMIT_BATCH_SIZE}")
             
             # Initialize unmatched files logging
             from datetime import datetime
@@ -771,7 +776,7 @@ class ModelSorterOrchestrator:
                 model_dir = os.path.dirname(working_model_path)
                 model_base_name = os.path.splitext(model_name)[0]
                 
-                # Look for associated files in the same directory (both database and resolved paths)
+                # Look for associated files in the same directory (both database and filesystem)
                 cursor.execute('''
                     SELECT sf.id, sf.file_path, sf.file_name
                     FROM scanned_files sf
@@ -780,6 +785,26 @@ class ModelSorterOrchestrator:
                 
                 potential_files = cursor.fetchall()
                 same_dir_files = [f for f in potential_files if os.path.dirname(f[1]) == model_dir]
+                
+                # ALSO check the actual filesystem directory for files not in the database
+                if os.path.exists(model_dir):
+                    try:
+                        for item in os.listdir(model_dir):
+                            item_path = os.path.join(model_dir, item)
+                            if os.path.isfile(item_path):
+                                # Check if it's a relevant file type
+                                ext = os.path.splitext(item)[1].lower()
+                                if ext in ['.json', '.txt', '.md', '.yml', '.yaml', '.png', '.jpg', '.jpeg', '.webp', '.mp4']:
+                                    # Check if it's already in our database results
+                                    already_found = any(f[1] == item_path for f in same_dir_files)
+                                    if not already_found:
+                                        # Add it as a filesystem file (use negative ID to distinguish)
+                                        same_dir_files.append((-1, item_path, item))
+                                        if self.verbose:
+                                            print(f"   📁 Found filesystem file not in DB: {item}")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"   ⚠️ Error reading directory {model_dir}: {e}")
                 
                 # If we resolved to a different path, also check that directory
                 if working_model_path != model_path:
@@ -902,199 +927,154 @@ class ModelSorterOrchestrator:
                 for assoc_sf_id, assoc_path, assoc_name in same_dir_files:
                     assoc_base_name = os.path.splitext(assoc_name)[0]
                     
-                    # Check if this file should be associated using sophisticated logic
+                    # SIMPLE CLEAR ASSOCIATION LOGIC: 
+                    # 1. Single model in folder → Auto-link ALL media/text files
+                    # 2. Multiple models → Link by name matching + verify text files by content
                     should_link = False
                     match_reason = ""
                     
-                    # METHOD 1: Check if FileScanner correlation identified this file
-                    if assoc_path in associated_files:
+                    if self.verbose:
+                        print(f"   🔍 Evaluating: {assoc_name}")
+                    
+                    # Check how many models are in this directory (use the working_model_path directory)
+                    working_model_dir = os.path.dirname(working_model_path)
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM model_files mf
+                        JOIN scanned_files sf ON mf.scanned_file_id = sf.id
+                        WHERE sf.file_path LIKE ? OR sf.file_path LIKE ?
+                    ''', (f"{model_dir}%", f"{working_model_dir}%"))
+                    models_in_dir = cursor.fetchone()[0]
+                    
+                    if self.verbose:
+                        print(f"   📊 Found {models_in_dir} models in directory (checking both {os.path.basename(model_dir)} and {os.path.basename(working_model_dir)})")
+                    
+                    if models_in_dir == 1:
+                        # RULE 1: Single model → Auto-link ALL files
                         should_link = True
-                        match_reason = "Advanced correlation"
+                        match_reason = "Single model in directory"
                         if self.verbose:
-                            print(f"   ✓ Advanced correlation match: {assoc_name}")
-                    
-                    # METHOD 1.5: Enhanced content-based correlation (ALWAYS check for metadata files and media)
-                    content_correlation_result = None
-                    if assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg')):
-                        content_correlation_result = self._analyze_content_correlation(
-                            assoc_path, assoc_name, model_name, model_sha256 or "", model_autov3 or ""
-                        )
-                        if content_correlation_result['should_link'] and not should_link:
+                            print(f"   ✅ Single model directory: Auto-linking {assoc_name}")
+                    else:
+                        # RULE 2: Multiple models → Name matching
+                        if self.verbose:
+                            print(f"   📁 Multiple models ({models_in_dir}) - checking name match")
+                        
+                        # Simple name matching: extract words from both filenames
+                        import re
+                        def get_words(filename):
+                            name = os.path.splitext(filename)[0].lower()
+                            if name.endswith('.metadata'):
+                                name = name[:-9]
+                            # Remove versions and numbers
+                            name = re.sub(r'[_\-\s]*v?\d+(\.\d+)*[_\-\s]*', ' ', name)
+                            name = re.sub(r'[_\-\s]*\d{4,}[_\-\s]*', ' ', name)
+                            # Get meaningful words (length > 2)
+                            words = [w for w in re.split(r'[_\-\s\.]+', name) if len(w) > 2]
+                            return set(words)
+                        
+                        model_words = get_words(model_name)
+                        file_words = get_words(assoc_name)
+                        common = model_words & file_words
+                        
+                        if len(common) >= 1:  # At least 1 word in common
                             should_link = True
-                            match_reason = f"Content correlation ({content_correlation_result['reason']})"
+                            match_reason = f"Name match: {list(common)}"
                             if self.verbose:
-                                print(f"   ✓ Content correlation match: {assoc_name}")
-                                print(f"      Reason: {content_correlation_result['details']}")
+                                print(f"   ✅ Name match: {common}")
+                        elif self.verbose:
+                            print(f"   ❌ No name match: {model_words} vs {file_words}")
                     
-                    # METHOD 2: Adaptive filename matching - version-aware or base name
-                    elif not should_link:
-                        # Check if any files in this directory have version info
-                        dir_files = [assoc_name for _, _, assoc_name in same_dir_files] + [model_name]
-                        has_versions = any(has_version_info(f) for f in dir_files)
-                        
-                        # Try version-aware matching first if versions are detected
-                        match_found = False
-                        if has_versions:
-                            # Try version-aware matching
-                            model_match_name = extract_adaptive_name(model_name, use_version_aware=True)
-                            assoc_match_name = extract_adaptive_name(assoc_name, use_version_aware=True)
-                            
-                            if (model_match_name.lower() == assoc_match_name.lower() and 
-                                assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg'))):
-                                should_link = True
-                                match_reason = "Version-aware filename match"
-                                match_found = True
-                                if self.verbose:
-                                    print(f"   ✓ Version-aware filename match: {assoc_name}")
-                                    print(f"      Matched: '{model_match_name}' == '{assoc_match_name}'")
-                        
-                        # If version-aware matching failed or no versions detected, try base name matching
-                        if not match_found:
-                            model_match_name = extract_adaptive_name(model_name, use_version_aware=False)
-                            assoc_match_name = extract_adaptive_name(assoc_name, use_version_aware=False)
-                            
-                            if (model_match_name.lower() == assoc_match_name.lower() and 
-                                assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg'))):
-                                should_link = True
-                                match_reason = "Base name filename match"
-                                if self.verbose:
-                                    print(f"   ✓ Base name filename match: {assoc_name}")
-                                    print(f"      Matched: '{model_match_name}' == '{assoc_match_name}' (after removing versions)")
+                    if self.verbose:
+                        print(f"   🎯 After name check - Should link: {should_link} ({match_reason})")
                     
-                    # METHOD 2.5: Base name match with target directory/database check
-                    elif not should_link:
-                        # Check if base names match - if so, search target directory and database
-                        model_base_name_clean = extract_adaptive_name(model_name, use_version_aware=False)
-                        assoc_base_name_clean = extract_adaptive_name(assoc_name, use_version_aware=False)
-                        
-                        if (model_base_name_clean.lower() == assoc_base_name_clean.lower() and 
-                            assoc_name.lower().endswith(('.json', '.txt', '.md', '.yml', '.yaml', '.metadata.json', '.civitai.info', '.mp4', '.webp', '.png', '.jpg', '.jpeg'))):
+                    # RULE 3: For text files, verify by content
+                    if assoc_name.lower().endswith(('.json', '.txt', '.md', '.metadata.json', '.civitai.info')):
+                        try:
+                            with open(assoc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read().lower()
                             
-                            # Base names match! Now check target directory and database for the file
-                            target_file_found = False
-                            target_file_path = None
+                            model_base = os.path.splitext(model_name)[0].lower()
+                            has_reference = (model_base in content or 
+                                           (model_sha256 and model_sha256.lower() in content) or
+                                           (model_autov3 and model_autov3.lower() in content))
                             
-                            # Check if file exists in target directory
-                            target_dir = self.scanner.config.get('target_directory', '')
-                            if target_dir:
-                                import glob
-                                
-                                # Search for the file in target directory recursively
-                                search_pattern = os.path.join(target_dir, "**", assoc_name)
-                                matches = glob.glob(search_pattern, recursive=True)
-                                if matches:
-                                    target_file_path = matches[0]  # Use first match
-                                    target_file_found = True
-                                    if self.verbose:
-                                        print(f"   🔍 Found in target directory: {target_file_path}")
-                            
-                            # Check database for file location if not found in target
-                            if not target_file_found:
-                                try:
-                                    cursor.execute('''
-                                        SELECT file_path FROM scanned_files 
-                                        WHERE file_name = ? OR file_path LIKE ?
-                                    ''', (assoc_name, f"%{assoc_name}"))
-                                    db_result = cursor.fetchone()
-                                    if db_result and os.path.exists(db_result[0]):
-                                        target_file_path = db_result[0]
-                                        target_file_found = True
-                                        if self.verbose:
-                                            print(f"   🔍 Found in database: {target_file_path}")
-                                except Exception as e:
-                                    if self.verbose:
-                                        print(f"   ⚠️ Database search error: {e}")
-                            
-                            # If file found, use previously computed correlation or perform new analysis
-                            if target_file_found and target_file_path:
-                                # Use existing correlation result if available, otherwise analyze
-                                if content_correlation_result is not None:
-                                    correlation_result = content_correlation_result
-                                elif model_sha256:
-                                    correlation_result = self._analyze_content_correlation(
-                                        target_file_path, assoc_name, model_name, model_sha256, model_autov3 or ""
-                                    )
-                                else:
-                                    correlation_result = {'should_link': False, 'reason': 'no_hash', 'details': 'No model hash available'}
-                                
-                                if correlation_result['should_link']:
+                            if has_reference:
+                                if not should_link:
                                     should_link = True
-                                    match_reason = f"Base name + target search + content correlation ({correlation_result['reason']})"
-                                    if self.verbose:
-                                        print(f"   ✓ Base name + target search + content correlation: {assoc_name}")
-                                        print(f"      Found at: {target_file_path}")
-                                        print(f"      Correlation: {correlation_result['details']}")
-                                    # Update the assoc_path to point to the found file
-                                    assoc_path = target_file_path
-                                elif target_file_found:
-                                    # Base name matches and file exists - check if we should link based on content quality
-                                    confidence_score = correlation_result.get('confidence_score', 0)
-                                    if confidence_score >= 30:  # Moderate confidence threshold
-                                        should_link = True
-                                        match_reason = f"Base name + target search + moderate correlation (score: {confidence_score})"
-                                        if self.verbose:
-                                            print(f"   ✓ Base name + target search + moderate correlation: {assoc_name}")
-                                            print(f"      Found at: {target_file_path}")
-                                            print(f"      Confidence: {confidence_score}% - {correlation_result['details']}")
-                                        # Update the assoc_path to point to the found file
-                                        assoc_path = target_file_path
-                                    else:
-                                        if self.verbose:
-                                            print(f"   ⚠️ Base name matches but low content correlation: {assoc_name}")
-                                            print(f"      Found at: {target_file_path}")
-                                            print(f"      Low confidence: {confidence_score}% - {correlation_result['details']}")
-                            
-                            # Even if file not found in target, check if we have strong content correlation from current location
-                            elif not target_file_found and content_correlation_result and content_correlation_result['should_link']:
-                                should_link = True
-                                match_reason = f"Base name + strong content correlation ({content_correlation_result['reason']})"
+                                    match_reason = "Content verification"
+                                else:
+                                    match_reason += " + content verified"
                                 if self.verbose:
-                                    print(f"   ✓ Base name + strong content correlation: {assoc_name}")
-                                    print(f"      Correlation: {content_correlation_result['details']}")
-                    
-                    # METHOD 3: Enhanced exact name match (with content correlation support)
-                    elif assoc_base_name == model_base_name:
-                        # For documentation/metadata files with exact name matches, use content correlation to boost confidence
-                        if (content_correlation_result and content_correlation_result.get('confidence_score', 0) >= 50) or assoc_name.lower().endswith(('.md', '.txt', '.json', '.yml', '.yaml', '.civitai.info')):
-                            should_link = True
-                            if content_correlation_result and content_correlation_result['should_link']:
-                                match_reason = f"Exact name + content correlation ({content_correlation_result['reason']})"
+                                    print(f"   ✅ Content verification passed")
+                            elif should_link and models_in_dir > 1:
+                                should_link = False
+                                match_reason = "Name matched but content verification failed"
                                 if self.verbose:
-                                    print(f"   ✓ Exact name + content correlation match: {assoc_name}")
-                                    print(f"      Correlation: {content_correlation_result['details']}")
-                            else:
-                                match_reason = "Exact name match (documentation file)"
-                                if self.verbose:
-                                    print(f"   ✓ Exact name match (documentation): {assoc_name}")
-                        else:
-                            should_link = True
-                            match_reason = "Exact name match"
+                                    print(f"   ❌ Content verification failed")
+                                    
+                        except Exception as e:
                             if self.verbose:
-                                print(f"   ✓ Exact name match: {assoc_name}")
+                                print(f"   ⚠️ Could not read {assoc_name}: {e}")
                     
-                    # METHOD 4: Single model scenario (fallback)
-                    elif len(models_needing_associations) == 1:  # Only one model in this batch
-                        # Check if only one model in this directory
-                        cursor.execute('''
-                            SELECT COUNT(*) FROM model_files mf
-                            JOIN scanned_files sf ON mf.scanned_file_id = sf.id
-                            WHERE sf.file_path LIKE ?
-                        ''', (f"{model_dir}%",))
-                        models_in_dir = cursor.fetchone()[0]
-                        if models_in_dir == 1:
-                            should_link = True
-                            match_reason = "Single model scenario"
-                            if self.verbose:
-                                print(f"   ✓ Single model scenario: {assoc_name}")
+                    # Legacy fallback logic (keeping some existing methods for compatibility)
+                    # Skip the old complex logic - using simple logic above
+                    # The new logic above handles all cases properly
                     
                     if should_link:
+                        if self.verbose:
+                            print(f"   ✅ FINAL DECISION: Linking {assoc_name} - {match_reason}")
+                        
+                        # Handle filesystem files not in database
+                        if assoc_sf_id == -1:
+                            if self.verbose:
+                                print(f"   📁 File not in database, adding to scanned_files first: {assoc_name}")
+                            try:
+                                # Add the file to scanned_files table
+                                # Determine file type for scanned_files table
+                                ext = os.path.splitext(assoc_name)[1].lower()
+                                if ext in ['.json']:
+                                    file_type = 'json'
+                                elif ext in ['.txt', '.md', '.yml', '.yaml']:
+                                    file_type = 'text'
+                                elif ext in ['.png', '.jpg', '.jpeg', '.webp', '.gif']:
+                                    file_type = 'image'
+                                elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
+                                    file_type = 'video'
+                                else:
+                                    file_type = 'unknown'
+                                
+                                cursor.execute('''
+                                    INSERT INTO scanned_files 
+                                    (file_path, file_name, file_size, sha256, file_type, extension, last_modified, scan_date)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                                ''', (
+                                    assoc_path, 
+                                    assoc_name, 
+                                    os.path.getsize(assoc_path) if os.path.exists(assoc_path) else 0,
+                                    '', # Empty SHA256 for now (can be calculated later if needed)
+                                    file_type,
+                                    ext,
+                                    os.path.getmtime(assoc_path) if os.path.exists(assoc_path) else 0
+                                ))
+                                assoc_sf_id = cursor.lastrowid
+                                if self.verbose:
+                                    print(f"   ✅ Added to database with ID: {assoc_sf_id}")
+                            except Exception as e:
+                                if self.verbose:
+                                    print(f"   ❌ Failed to add file to database: {e}")
+                                continue
+                        
                         # Check if association already exists
                         cursor.execute('''
                             SELECT 1 FROM associated_files 
                             WHERE model_file_id = ? AND scanned_file_id = ?
                         ''', (model_file_id, assoc_sf_id))
                         
-                        if not cursor.fetchone():
+                        existing = cursor.fetchone()
+                        if self.verbose:
+                            print(f"   🔍 Association check: {'Already exists' if existing else 'New association needed'}")
+                        
+                        if not existing:
                             assoc_type = self._determine_association_type(assoc_path)
                             
                             # Try to write to database, handle read-only gracefully
@@ -1129,6 +1109,9 @@ class ModelSorterOrchestrator:
                         
                         missing_associations_found += 1
                     else:
+                        if self.verbose:
+                            print(f"   ❌ NOT LINKING: {assoc_name} - {match_reason or 'No valid association criteria met'}")
+                        
                         # Log unmatched file with detailed information
                         unmatched_entry = {
                             'model_name': model_name,
